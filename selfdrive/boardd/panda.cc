@@ -1,31 +1,15 @@
-#include <stdexcept>
-#include <cassert>
-#include <iostream>
-#include <vector>
+#include "selfdrive/boardd/panda.h"
+
 #include <unistd.h>
 
-#include "common/swaglog.h"
-#include "common/gpio.h"
-#include "common/util.h"
-#include "messaging.hpp"
-#include "panda.h"
+#include <cassert>
+#include <stdexcept>
+#include <vector>
 
-void panda_set_power(bool power){
-#ifdef QCOM2
-  int err = 0;
-
-  err += gpio_init(GPIO_STM_RST_N, true);
-  err += gpio_init(GPIO_STM_BOOT0, true);
-
-  err += gpio_set(GPIO_STM_RST_N, true);
-  err += gpio_set(GPIO_STM_BOOT0, false);
-
-  util::sleep_for(100); // 100 ms
-
-  err += gpio_set(GPIO_STM_RST_N, !power);
-  assert(err == 0);
-#endif
-}
+#include "cereal/messaging/messaging.h"
+#include "selfdrive/common/gpio.h"
+#include "selfdrive/common/swaglog.h"
+#include "selfdrive/common/util.h"
 
 Panda::Panda(){
   // init libusb
@@ -52,13 +36,12 @@ Panda::Panda(){
   if (err != 0) { goto fail; }
 
   hw_type = get_hw_type();
-  is_pigeon =
-    (hw_type == cereal::HealthData::PandaType::GREY_PANDA) ||
-    (hw_type == cereal::HealthData::PandaType::BLACK_PANDA) ||
-    (hw_type == cereal::HealthData::PandaType::UNO) ||
-    (hw_type == cereal::HealthData::PandaType::DOS);
-  has_rtc = (hw_type == cereal::HealthData::PandaType::UNO) ||
-    (hw_type == cereal::HealthData::PandaType::DOS);
+
+  assert((hw_type != cereal::PandaState::PandaType::WHITE_PANDA) &&
+         (hw_type != cereal::PandaState::PandaType::GREY_PANDA));
+
+  has_rtc = (hw_type == cereal::PandaState::PandaType::UNO) ||
+            (hw_type == cereal::PandaState::PandaType::DOS);
 
   return;
 
@@ -168,6 +151,7 @@ int Panda::usb_bulk_read(unsigned char endpoint, unsigned char* data, int length
     if (err == LIBUSB_ERROR_TIMEOUT) {
       break; // timeout is okay to exit, recv still happened
     } else if (err == LIBUSB_ERROR_OVERFLOW) {
+      comms_healthy = false;
       LOGE_100("overflow got 0x%x", transferred);
     } else if (err != 0) {
       handle_usb_issue(err, __func__);
@@ -186,11 +170,11 @@ void Panda::set_unsafe_mode(uint16_t unsafe_mode) {
   usb_write(0xdf, unsafe_mode, 0);
 }
 
-cereal::HealthData::PandaType Panda::get_hw_type() {
+cereal::PandaState::PandaType Panda::get_hw_type() {
   unsigned char hw_query[1] = {0};
 
   usb_read(0xc1, 0, 0, hw_query, 1);
-  return (cereal::HealthData::PandaType)(hw_query[0]);
+  return (cereal::PandaState::PandaType)(hw_query[0]);
 }
 
 void Panda::set_rtc(struct tm sys_time){
@@ -242,7 +226,7 @@ void Panda::set_ir_pwr(uint16_t ir_pwr) {
   usb_write(0xb0, ir_pwr, 0);
 }
 
-health_t Panda::get_health(){
+health_t Panda::get_state(){
   health_t health {0};
   usb_read(0xd2, 0, 0, (unsigned char*)&health, sizeof(health));
   return health;
@@ -269,7 +253,7 @@ void Panda::set_power_saving(bool power_saving){
   usb_write(0xe7, power_saving, 0);
 }
 
-void Panda::set_usb_power_mode(cereal::HealthData::UsbPowerMode power_mode){
+void Panda::set_usb_power_mode(cereal::PandaState::UsbPowerMode power_mode){
   usb_write(0xe6, (uint16_t)power_mode, 0);
 }
 
@@ -312,9 +296,11 @@ int Panda::can_receive(kj::Array<capnp::word>& out_buf) {
 
   size_t num_msg = recv / 0x10;
   MessageBuilder msg;
-  auto canData = msg.initEvent().initCan(num_msg);
+  auto evt = msg.initEvent();
+  evt.setValid(comms_healthy);
 
   // populate message
+  auto canData = evt.initCan(num_msg);
   for (int i = 0; i < num_msg; i++) {
     if (data[i*4] & 4) {
       // extended
